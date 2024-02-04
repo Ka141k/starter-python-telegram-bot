@@ -1,45 +1,59 @@
-import os
-from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, Depends
-from telegram import Update, Bot
-from pydantic import BaseModel
+import asyncio, logging
+from contextlib import asynccontextmanager, suppress
 
-class TelegramUpdate(BaseModel):
-    update_id: int
-    message: dict
+from aiogram import Router, Bot, Dispatcher
+from aiogram.types import Message, Update
+from aiogram.filters import CommandStart
+from aiogram.utils.markdown import hlink
 
-app = FastAPI()
+from middlewares.throttling import ThrottlingMiddleware
+from handlers import user_group_commands
 
-# Load variables from .env file if present
-load_dotenv()
+from config import BOT_TOKEN, WEBHOOK_URL, WEBHOOK_PATH
+from fastapi import FastAPI, Request # pip install fastapi[all]
+# from app import keep_alive
 
-# Read the variable from the environment (or .env file)
-bot_token = os.getenv('BOT_TOKEN')
-secret_token = os.getenv("SECRET_TOKEN")
-# webhook_url = os.getenv('CYCLIC_URL', 'http://localhost:8181') + "/webhook/"
+@asynccontextmanager
+async def on_startup(app: FastAPI) -> None:
+    await bot.delete_webhook(True)
+    await bot.set_webhook(WEBHOOK_URL) # Устанавливаем URL для наших вебхуков
+    yield
 
-bot = Bot(token=bot_token)
-# bot.set_webhook(url=webhook_url)
-# webhook_info = bot.get_webhook_info()
-# print(webhook_info)
 
-def auth_telegram_token(x_telegram_bot_api_secret_token: str = Header(None)) -> str:
-    # return true # uncomment to disable authentication
-    if x_telegram_bot_api_secret_token != secret_token:
-        raise HTTPException(status_code=403, detail="Not authenticated")
-    return x_telegram_bot_api_secret_token
+bot = Bot(BOT_TOKEN, parse_mode='HTML')
+dp = Dispatcher()
+app = FastAPI(lifespan=on_startup) # lifespan, как on_startup
 
-@app.post("/webhook/")
-async def handle_webhook(update: TelegramUpdate, token: str = Depends(auth_telegram_token)):
-    chat_id = update.message["chat"]["id"]
-    text = update.message["text"]
-    # print("Received message:", update.message)
+logging.basicConfig(level=logging.INFO)
 
-    if text == "/start":
-        with open('hello.gif', 'rb') as photo:
-            await bot.send_photo(chat_id=chat_id, photo=photo)
-        await bot.send_message(chat_id=chat_id, text="Welcome to Cyclic Starter Python Telegram Bot!")
-    else:
-        await bot.send_message(chat_id=chat_id, reply_to_message_id=update.message["message_id"], text="Yo!")
+router = Router()
 
-    return {"ok": True}
+
+@router.message(CommandStart())
+async def start_cmd(message: Message) -> None:
+  await message.answer(
+      f'Привет, {hlink(message.from_user.first_name, f"tg://user?id={message.from_user.id}")}\n\nДобавь меня в группу, чтобы начать работу!'
+  )
+
+
+@app.post(WEBHOOK_PATH)
+async def bot_webhook_updates(request: Request) -> None:
+    # Осуществляем валидацию входящего обновления и получаем ответ
+
+    update = Update.model_validate(await request.json(), context={"bot": bot})
+    await dp.feed_update(bot, update)
+
+
+async def main() -> None:
+  dp.message.middleware(ThrottlingMiddleware())
+
+  dp.include_routers(router, user_group_commands.router)
+
+  await bot.delete_webhook(False)
+  await dp.start_polling(bot)
+
+
+# keep_alive()
+
+if __name__ == "__main__":
+  asyncio.run(main())
